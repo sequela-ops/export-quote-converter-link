@@ -1,7 +1,7 @@
 /**
- * 外贸报价计算器 Pro - V6 最终版
+ * 外贸报价计算器 Pro - V6 最终版 (DeepSeek AI集成版)
  * 部署环境: Supabase Edge Functions (Deno)
- * 核心引擎: Google Gemini 1.5 Flash (Singapore Node)
+ * 核心引擎: DeepSeek API (支持 V3 / R1)
  */
 
 Deno.serve(async (req) => {
@@ -15,7 +15,7 @@ Deno.serve(async (req) => {
 
   try {
     const { action, payload } = await req.json()
-    const apiKey = Deno.env.get('GEMINI_API_KEY')
+    const apiKey = Deno.env.get('DEEPSEEK_API_KEY')
 
     if (!apiKey) throw new Error("API_KEY_NOT_CONFIGURED")
 
@@ -54,7 +54,7 @@ Deno.serve(async (req) => {
          - **输出要求：直接输出邮件正文，严禁包含任何开场白、解释语或结束语。**
       `;
 
-      return await callGeminiAPI(apiKey, systemInstruction, userPrompt, corsHeaders);
+      return await callDeepSeekAPI(apiKey, systemInstruction, userPrompt, corsHeaders);
     }
 
     // --- 场景二：智能 HS Code 审计 ---
@@ -64,11 +64,11 @@ Deno.serve(async (req) => {
         分析产品 "${payload.productDescription}" 进入 "${payload.destinationCountry}" 的贸易环境。
         请严格按此格式返回（简体中文）：
         1. 📋 建议 HS Code: [给出6位国际通用码及逻辑]
-        2. 📉 进口成本: [目标国关税与VAT环境]
-        3. 🛡️ 准入认证: [必要证书如CE/FDA/GCC等]
-        4. 🚨 清关风控: [反倾销或禁限规则提醒]
+        2. 📉 进口成本:[目标国关税与VAT环境]
+        3. 🛡️ 准入认证:[必要证书如CE/FDA/GCC等]
+        4. 🚨 清关风控:[反倾销或禁限规则提醒]
       `;
-      return await callGeminiAPI(apiKey, systemInstruction, userPrompt, corsHeaders);
+      return await callDeepSeekAPI(apiKey, systemInstruction, userPrompt, corsHeaders);
     }
 
     throw new Error("UNKNOWN_ACTION");
@@ -83,47 +83,60 @@ Deno.serve(async (req) => {
 })
 
 /**
- * 核心 API 调用函数
+ * 核心 API 调用函数 (全面重构为 DeepSeek 官方标准接口)
  */
-async function callGeminiAPI(key, system, user, headers) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-002:generateContent?key=${key}`;
+async function callDeepSeekAPI(key, system, user, headers) {
+  const url = `https://api.deepseek.com/chat/completions`;
   
   try {
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000); // 15秒超时
+    // 【架构升级】：超时保护从 15 秒提升至 30 秒，防止先进模型的大吞吐量输出被错误截断
+    const timeout = setTimeout(() => controller.abort(), 30000); 
 
     const response = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${key}` // 升级为标准 Header 鉴权
+      },
       signal: controller.signal,
       body: JSON.stringify({
-        system_instruction: { parts: [{ text: system }] },
-        contents: [
-          { 
-            role: "user",
-            parts: [{ text: user }]
-          }
+        // 【模型定义】：
+        // "deepseek-chat" = DeepSeek-V3 模型 (遵循指令极强，响应快，符合您的模板规范，推荐作为默认)
+        // 进阶用法：若您的 HS Code 审计未来需要极其严谨的海关法规推演，可将此处替换为 "deepseek-reasoner" 调用 R1 满血思考模型
+        model: "deepseek-chat",
+        messages:[
+          { role: "system", content: system },
+          { role: "user", content: user }
         ],
-        generationConfig: { 
-          temperature: 0.3, 
-          maxOutputTokens: 2000,
-          topP: 0.8
-        }
+        // 参数映射升级：摒弃 Gemini 复杂的 generationConfig 嵌套结构
+        temperature: 0.3, 
+        max_tokens: 2000,
+        top_p: 0.8,
+        stream: false
       })
     });
 
     clearTimeout(timeout);
+
+    // 【健壮性升级】：主动捕获 API 限流/拥堵时的非 JSON HTML 报错，防止业务端崩溃
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`HTTP ${response.status}: ${errorText}`);
+    }
+
     const data = await response.json();
 
     if (data.error) {
       return new Response(JSON.stringify({ result: `AI 暂时不可用: ${data.error.message}` }), { headers });
     }
 
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "AI 忙碌中，请稍后。";
+    // 数据路径精确解析：兼容 DeepSeek / OpenAI 协议的标准路径
+    const text = data.choices?.[0]?.message?.content || "AI 忙碌中，请稍后。";
     return new Response(JSON.stringify({ result: text }), { headers });
 
   } catch (e) {
-    const msg = e.name === 'AbortError' ? "请求超时，请稍后重试" : e.message;
+    const msg = e.name === 'AbortError' ? "请求超时(已超过30秒限制)，请稍后重试" : e.message;
     return new Response(JSON.stringify({ result: `连接 AI 失败: ${msg}` }), { headers });
   }
 }
