@@ -86,7 +86,7 @@ Deno.serve(async (req) => {
  * 核心 API 调用函数
  */
 async function callGeminiAPI(key, system, user, headers) {
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${key}`;
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${key}`;
   
   try {
     const controller = new AbortController();
