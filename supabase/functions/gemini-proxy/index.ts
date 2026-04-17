@@ -2,13 +2,13 @@
  * 外贸报价计算器 Pro - V6 最终版 (Qwen AI集成版)
  * 部署环境: Supabase Edge Functions (Deno)
  * 核心引擎: Qwen API (支持 Qwen3.6-plus)
+ * 架构: SSE Streaming — 解决 25s wall-clock timeout 问题
  */
 
 Deno.serve(async (req) => {
   const corsHeaders = {
     'Access-Control-Allow-Origin': '*',
     'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-    'Content-Type': 'application/json'
   }
 
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
@@ -54,7 +54,7 @@ Deno.serve(async (req) => {
          - **输出要求：直接输出邮件正文，严禁包含任何开场白、解释语或结束语。**
       `;
 
-      return await callQwenAPI(apiKey, systemInstruction, userPrompt, corsHeaders);
+      return await callQwenAPIStream(apiKey, systemInstruction, userPrompt, corsHeaders);
     }
 
     // --- 场景二：智能 HS Code 审计 ---
@@ -68,72 +68,125 @@ Deno.serve(async (req) => {
         3. 🛡️ 准入认证:[必要证书如CE/FDA/GCC等]
         4. 🚨 清关风控:[反倾销或禁限规则提醒]
       `;
-      return await callQwenAPI(apiKey, systemInstruction, userPrompt, corsHeaders);
+      return await callQwenAPIStream(apiKey, systemInstruction, userPrompt, corsHeaders);
     }
 
     throw new Error("UNKNOWN_ACTION");
 
   } catch (err) {
     console.error(`[Error]: ${err.message}`);
-    return new Response(JSON.stringify({ error: err.message }), { 
-      status: 200, 
-      headers: corsHeaders 
+    // 错误也以 SSE 格式返回，保持前端解析一致
+    const errorStream = new ReadableStream({
+      start(controller) {
+        const data = JSON.stringify({ error: err.message });
+        controller.enqueue(new TextEncoder().encode(`data: ${data}\n\n`));
+        controller.enqueue(new TextEncoder().encode(`data: [DONE]\n\n`));
+        controller.close();
+      }
+    });
+    return new Response(errorStream, {
+      status: 200,
+      headers: { ...corsHeaders, 'Content-Type': 'text/event-stream' }
     });
   }
 })
 
 /**
- * 核心 API 调用函数 (全面重构为 Qwen-华北 官方标准接口)
+ * 核心 API 调用函数 — SSE Streaming 版本
+ * 
+ * 架构要点：
+ * - 向 Qwen 发起 stream:true 请求，拿到流式响应
+ * - 将 Qwen 的 SSE chunks 转发给前端，解决 Supabase 25s wall-clock timeout
+ * - 只要第一个 chunk 在 25s 内到达，连接就不会被 shutdown
+ * - Qwen3.6-plus 思考过程的 token 不计入 max_tokens，只影响首包延迟
  */
-async function callQwenAPI(key, system, user, headers) {
+async function callQwenAPIStream(key, system, user, corsHeaders) {
   const url = `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`;
-  
-  try {
-    const controller = new AbortController();
-    // 【架构升级】：超时保护从 15 秒提升至 30 秒，防止先进模型的大吞吐量输出被错误截断
-    const timeout = setTimeout(() => controller.abort(), 30000); 
 
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${key}` // 升级为标准 Header 鉴权
-      },
-      signal: controller.signal,
-      body: JSON.stringify({
-        // 【温馨提示】：注意"qwen3.6-plus"模型用量控制，免费额度用尽后请切换至其他可用模型。
-        model: "qwen3.6-plus",
-        messages:[
-          { role: "system", content: system },
-          { role: "user", content: user }
-        ],
-        temperature: 0.3, 
-        max_tokens: 2000,
-        top_p: 0.8,
-        stream: false
-      })
-    });
+  // TransformStream：把 Qwen SSE 流转换成只含 content 文本的精简 SSE 流
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
 
-    clearTimeout(timeout);
+  // 异步处理流，不阻塞 Response 返回
+  (async () => {
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${key}`
+        },
+        body: JSON.stringify({
+          // 【温馨提示】：注意"qwen3.6-plus"模型用量控制，免费额度用尽后请切换至其他可用模型。
+          model: "qwen3.6-plus",
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: user }
+          ],
+          temperature: 0.3,
+          max_tokens: 2000,
+          top_p: 0.8,
+          stream: true  // 【核心改动】开启流式输出
+        })
+      });
 
-    // 【健壮性升级】：主动捕获 API 限流/拥堵时的非 JSON HTML 报错，防止业务端崩溃
-    if (!response.ok) {
-      const errorText = await response.text();
-      throw new Error(`HTTP ${response.status}: ${errorText}`);
+      if (!response.ok) {
+        const errorText = await response.text();
+        const errMsg = `HTTP ${response.status}: ${errorText.slice(0, 200)}`;
+        await writer.write(encoder.encode(`data: ${JSON.stringify({ error: errMsg })}\n\n`));
+        await writer.write(encoder.encode(`data: [DONE]\n\n`));
+        await writer.close();
+        return;
+      }
+
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const raw = line.slice(6).trim();
+          if (raw === '[DONE]') {
+            // 转发终止信号
+            await writer.write(encoder.encode(`data: [DONE]\n\n`));
+            continue;
+          }
+          try {
+            const parsed = JSON.parse(raw);
+            // 过滤 thinking 内容（reasoning_content），只转发 content
+            const content = parsed.choices?.[0]?.delta?.content;
+            if (content) {
+              // 只把 content 片段转发，格式精简
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ chunk: content })}\n\n`));
+            }
+          } catch {
+            // 跳过无法解析的行（心跳包等）
+          }
+        }
+      }
+
+    } catch (e) {
+      const msg = e.name === 'AbortError' ? "上游请求超时" : e.message;
+      await writer.write(encoder.encode(`data: ${JSON.stringify({ error: `连接 AI 失败: ${msg}` })}\n\n`));
+      await writer.write(encoder.encode(`data: [DONE]\n\n`));
+    } finally {
+      await writer.close().catch(() => {});
     }
+  })();
 
-    const data = await response.json();
-
-    if (data.error) {
-      return new Response(JSON.stringify({ result: `AI 暂时不可用: ${data.error.message}` }), { headers });
+  return new Response(readable, {
+    headers: {
+      ...corsHeaders,
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'X-Accel-Buffering': 'no'  // 禁止 Nginx 缓冲，确保 chunks 实时推送
     }
-
-    // 数据路径精确解析：兼容 Qwen / OpenAI 协议的标准路径
-    const text = data.choices?.[0]?.message?.content || "AI 忙碌中，请稍后。";
-    return new Response(JSON.stringify({ result: text }), { headers });
-
-  } catch (e) {
-    const msg = e.name === 'AbortError' ? "请求超时(已超过30秒限制)，请稍后重试" : e.message;
-    return new Response(JSON.stringify({ result: `连接 AI 失败: ${msg}` }), { headers });
-  }
+  });
 }
