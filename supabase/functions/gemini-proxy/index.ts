@@ -32,40 +32,86 @@ Deno.serve(async (req) => {
 
     if (!apiKey) throw new Error("API_KEY_NOT_CONFIGURED")
 
-    // --- 场景一：高转化率报价邮件（深度集成用户约束） ---
+    // --- 场景一：Elite Closer 驱动报价邮件（成交驱动型） ---
     if (action === 'generate_email') {
-      const systemInstruction = `你是一位拥有15年全球贸易经验的资深外贸专家，精通跨文化沟通与高转化率文案。你自信、专业、有分寸感，强调产品价值和服务优势。`;
-      
+      const systemInstruction = `
+你是一位顶级外贸成交专家（Elite Closer），你的核心能力是：
+在不冒犯客户的前提下，自然推动对方做出“立即行动”。
+
+你的思维方式：
+- 客户不是缺信息，而是缺“决策理由”
+- 邮件的目标不是灌输各种数据，而是减少拖延
+- 每一句话要么降低风险感，要么推动具体的下一步
+
+你的风格：
+- 简洁、有控制力、掌控感
+- 像一个在真实做生意的人，而不是写模板的人
+`;
+
+      const ld = payload.logisticsData || {};
+      const hasLogistics = !!(ld.l && ld.perCtn);
+      const logisticsInfo = hasLogistics ? 
+        `- Logistics Detail: ${Math.ceil(ld.totalPcs / ld.perCtn)} Cartons, ${ld.logisticsMode === 'sea' ? ld.result + ' RT' : ld.result + ' KG'}
+         - Feasibility: Current space availability checked for these dimensions.` : 
+        `- Shipping Context: Order volume based pricing.`;
+
       const userPrompt = `
-      # Context
-      - Product: ${payload.productName || 'Target Product'}
-      - Incoterms: ${payload.incoterms}
-      - Destination: ${payload.destination}
-      - Quoted Price: USD ${payload.unitPrice}
-      - Total Amount: USD ${payload.totalPrice}
-      - Key Notes: ${payload.notes}
+# Context
+- Product: ${payload.productName || 'Target Product'}
+- Incoterms: ${payload.incoterms}
+- Destination: ${payload.destination}
+- Quoted Price: USD ${payload.unitPrice}
+- Total Amount: USD ${payload.totalPrice}
+${logisticsInfo}
+- Key Notes: ${payload.notes}
+- Sales Mode: ${payload.salesMode || 'Balanced'}
 
-      # Task
-      撰写一封专业、且具备成交推动力的英文报价/跟进邮件。
+# Task
+撰写一封以“推动客户确认订单”为目标的英文报价邮件。
 
-      # Requirements (必须严格执行)
-      1. **模块化写作结构**：
-         - 第一步：确认客户需求/背景。
-         - 第二步：展示专业报价（使用上述提供的数据）。
-         - 第三步：提供优势提醒或风险预警（基于 ${payload.incoterms} 条款给客户带来的保障）。
-         - 第四步：明确的行动启发（Call to Action）。
+# Requirements (必须执行)
 
-      2. **核心禁令 (商业机密保护)**：
-         - **严禁提及或暗示任何关于“进货底价”、“成本构成”、“内部利润率”或“降价空间”的信息。**
-         - **报价口径：仅使用提供的“Quoted Price”进行陈述，绝对不得向客户解释价格是如何计算出来的。**
-         - 严禁出现 "Our cost is..." 或 "My profit is very low" 等非专业、乞求式的表达。
-         - 严禁任何 "Dear respected sir" 这种过时称呼。
+## 1. 成交结构（必须遵循）
+- Hook（1句）：确认需求，直接进入主题
+- Clarity：清晰给出报价 +（如有）物流可执行性
+- Value：说明此方案如何降低客户操作复杂度或风险
+- Real Urgency（关键）：
+  - 必须使用“当前市场语境”（如 recently / current / this week）
+  - 必须具体（不可泛泛而谈）
+- Action Step（关键）：
+  - 明确客户需要做的动作（confirm / sign PI / reply）
+  - 明确确认后你会做什么（lock price / secure space / start production）
 
-      3. **语气与风格**：
-         - 语气：自信、专业、利他主义、符合国际商务礼仪。
-         - 表达：地道商务英语，拒绝中式翻译。
-         - **输出要求：直接输出邮件正文，严禁包含任何开场白、解释语或结束语。**
-      `;
+## 2. 决策引导（必须包含）
+必须包含一句“建议性引导”，例如：
+- we suggest proceeding with this structure
+- this setup would be the most efficient option
+
+👉 目的：减少客户思考成本
+
+## 3. Urgency强度控制
+- Balanced：保持商务礼仪，轻微提醒（默认）
+- Closing：明确强调“可能变化 + 建议尽快确认”（例如排产或物流舱位的“临界点”等）
+
+## 4. 物流表达
+${hasLogistics 
+? "- 必须自然提及箱数 + CBM/重量，让方案显得可立即执行" 
+: "- 无物流数据时，强调价格或排产的有效期"}
+
+## 5. 严格禁令
+- 禁止解释成本
+- 禁止营销词（best price / huge discount）
+- 禁止长段解释DDP
+- 禁止空话
+
+## 6. 风格
+- 150–220词
+- 每句话必须有“功能”（信息 or 推动决策）
+- 像真实业务员写的，而不是AI
+
+## 7. 输出
+直接输出邮件正文
+`;
 
       return await callQwenAPIStream(apiKey, systemInstruction, userPrompt, corsHeaders);
     }
