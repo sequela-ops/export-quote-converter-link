@@ -3,7 +3,7 @@ name: Deploy Edge Function
 on:
   push:
     branches:
-      - main  # 如果你的主分支叫 master，请改写为 master
+      - main # 如果你的主分支叫 master，请改写为 master
 
 jobs:
   deploy:
@@ -19,6 +19,7 @@ jobs:
 
       - name: Deploy Function
         run: |
-          supabase functions deploy gemini-proxy --project-ref ${{ secrets.SUPABASE_PROJECT_ID }}
+          # 在末尾加上了 --no-verify-jwt 永久关闭鉴权拦截
+          supabase functions deploy gemini-proxy --project-ref ${{ secrets.SUPABASE_PROJECT_ID }} --no-verify-jwt
         env:
           SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
