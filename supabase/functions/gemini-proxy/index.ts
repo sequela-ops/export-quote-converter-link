@@ -6,8 +6,21 @@
  */
 
 Deno.serve(async (req) => {
+  // 1. 获取当前请求的来源域名
+  const origin = req.headers.get('Origin');
+  
+  // 2. 配置您的专属白名单（绝对不能带子路径和末尾斜杠）
+  const allowedOrigins =[
+    'https://sequela-ops.github.io',  // ✅ 只需要到 .io 结束，不能有后面的路径
+    'http://127.0.0.1:5500',          // 供本地 VSCode Live Server 测试用
+    'http://localhost:5500'           // 供本地测试用
+  ];
+
+  // 3. 如果请求来源在白名单里，就允许；否则默认只允许您的 GitHub Pages 主域名
+  const allowOrigin = allowedOrigins.includes(origin) ? origin : 'https://sequela-ops.github.io';
+
   const corsHeaders = {
-    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Origin': allowOrigin,
     'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
   }
 
