@@ -1,0 +1,24 @@
+name: Deploy Edge Function
+
+on:
+  push:
+    branches:
+      - main  # 如果你的主分支叫 master，请改写为 master
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Deploy Function
+        run: |
+          supabase functions deploy gemini-proxy --project-ref ${{ secrets.SUPABASE_PROJECT_ID }}
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
