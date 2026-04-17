@@ -1,98 +1,124 @@
-import { serve } from "https://deno.land/std@0.168.0/http/server.ts"
+/**
+ * 外贸报价计算器 Pro - V6 最终版
+ * 部署环境: Supabase Edge Functions (Deno)
+ * 核心引擎: Google Gemini 1.5 Flash (Singapore Node)
+ */
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
-}
+Deno.serve(async (req) => {
+  const corsHeaders = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+    'Content-Type': 'application/json'
+  }
 
-serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
 
   try {
     const { action, payload } = await req.json()
     const apiKey = Deno.env.get('GEMINI_API_KEY')
-    if (!apiKey) throw new Error('Backend Secret Missing: GEMINI_API_KEY')
 
-    // 1. 数据预处理：防止前端传空值导致模型幻觉
-    const clean = (val: any) => (val && val !== 'null') ? val : "Not Specified";
+    if (!apiKey) throw new Error("API_KEY_NOT_CONFIGURED")
 
-    let systemInstruction = "";
-    let userPrompt = "";
-
-    // --- 场景一：智能撰写高转化率邮件 ---
+    // --- 场景一：高转化率报价邮件（深度集成用户约束） ---
     if (action === 'generate_email') {
-      systemInstruction = `你是一位拥有20年实战经验的高级外贸主管，擅长地道的商务英语和博弈。你的目标是写出让客户无法拒绝、展现专业度且没有中式英语痕迹的报价跟进邮件。`;
-      userPrompt = `
+      const systemInstruction = `你是一位拥有15年全球贸易经验的资深外贸专家，精通跨文化沟通与高转化率文案。你自信、专业、有分寸感，强调产品价值和服务优势。`;
+      
+      const userPrompt = `
       # Context
-      - 产品: ${clean(payload.productName)}
-      - 贸易术语: ${clean(payload.incoterms)} (请在邮件中体现出该术语下我方的专业服务保障)
-      - 目的港/国: ${clean(payload.destination)}
-      - 报价: ${clean(payload.unitPrice)} (Total: ${clean(payload.totalPrice)})
-      - 附加细节: ${clean(payload.notes)}
+      - Product: ${payload.productName || 'Target Product'}
+      - Incoterms: ${payload.incoterms}
+      - Destination: ${payload.destination}
+      - Quoted Price: USD ${payload.unitPrice}
+      - Total Amount: USD ${payload.totalPrice}
+      - Key Notes: ${payload.notes}
 
-      # Constraints
-      - 严禁任何 "Dear respected sir" 这种过时称呼。
-      - 采用模块化写作：确认需求 -> 专业报价 -> 优势/风险提醒 -> 明确的行动启发。
-      - **商业机密保护：严禁提及或暗示任何关于“进货底价”、“成本构成”、“内部利润率”或“降价空间”的信息。**
-      - **报价口径：仅使用提供的“建议报价”进行陈述，不得向客户解释价格是如何计算出来的。**
-      - 严禁出现 "Our cost is..." 或 "My profit is very low" 等非专业、乞求式的表达。
-      - 语气：自信、专业、有分寸感、利他主义、强调产品价值和服务优势、符合国际商务礼仪。
-      - **直接输出邮件内容，严禁任何解释语。**
+      # Task
+      撰写一封专业、且具备成交推动力的英文报价/跟进邮件。
+
+      # Requirements (必须严格执行)
+      1. **模块化写作结构**：
+         - 第一步：确认客户需求/背景。
+         - 第二步：展示专业报价（使用上述提供的数据）。
+         - 第三步：提供优势提醒或风险预警（基于 ${payload.incoterms} 条款给客户带来的保障）。
+         - 第四步：明确的行动启发（Call to Action）。
+
+      2. **核心禁令 (商业机密保护)**：
+         - **严禁提及或暗示任何关于“进货底价”、“成本构成”、“内部利润率”或“降价空间”的信息。**
+         - **报价口径：仅使用提供的“Quoted Price”进行陈述，绝对不得向客户解释价格是如何计算出来的。**
+         - 严禁出现 "Our cost is..." 或 "My profit is very low" 等非专业、乞求式的表达。
+         - 严禁任何 "Dear respected sir" 这种过时称呼。
+
+      3. **语气与风格**：
+         - 语气：自信、专业、利他主义、符合国际商务礼仪。
+         - 表达：地道商务英语，拒绝中式翻译。
+         - **输出要求：直接输出邮件正文，严禁包含任何开场白、解释语或结束语。**
       `;
-    } 
 
-    // --- 场景二：HS Code 预测与贸易合规审计 ---
-    else if (action === 'predict_hs') {
-      systemInstruction = `你是一位全球通关合规审计专家，精通 WCO HS 协调制度、各国贸易准入壁垒及关税政策。`;
-      userPrompt = `
-      # Objective
-      预测产品 "${clean(payload.productDescription)}" 进入 "${clean(payload.destinationCountry)}" 的 HS Code 并预警风险。
-
-      # Output Structure (严格遵循)
-      1. 📋 **核心编码**: [给出前6位国际通用码，说明分类逻辑]
-      2. 📉 **进口成本**: [预估该国对该品类的平均 MFN 税率，如涉及中国出口，请特别提醒是否有特定壁垒]
-      3. 🛡️ **准入认证**: [列出必须的证书，如 CE, UKCA, REACH, FDA, UL, GCC 等]
-      4. 🚨 **风控预警**: [重点提及反倾销、反补贴、知识产权或该国特定清关雷区]
-
-      **语言: 简体中文。回答要硬核、干练。**
-      `;
+      return await callGeminiAPI(apiKey, systemInstruction, userPrompt, corsHeaders);
     }
 
-    // 2. 使用 Gemini 1.5 Flash 高级调用模式
-    const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+    // --- 场景二：智能 HS Code 审计 ---
+    else if (action === 'predict_hs') {
+      const systemInstruction = `你是一位精通全球海关编码与国际贸易合规的审计专家。`;
+      const userPrompt = `
+        分析产品 "${payload.productDescription}" 进入 "${payload.destinationCountry}" 的贸易环境。
+        请严格按此格式返回（简体中文）：
+        1. 📋 建议 HS Code: [给出6位国际通用码及逻辑]
+        2. 📉 进口成本: [目标国关税与VAT环境]
+        3. 🛡️ 准入认证: [必要证书如CE/FDA/GCC等]
+        4. 🚨 清关风控: [反倾销或禁限规则提醒]
+      `;
+      return await callGeminiAPI(apiKey, systemInstruction, userPrompt, corsHeaders);
+    }
+
+    throw new Error("UNKNOWN_ACTION");
+
+  } catch (err) {
+    console.error(`[Error]: ${err.message}`);
+    return new Response(JSON.stringify({ error: err.message }), { 
+      status: 200, 
+      headers: corsHeaders 
+    });
+  }
+})
+
+/**
+ * 核心 API 调用函数
+ */
+async function callGeminiAPI(key, system, user, headers) {
+  const url = `https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent?key=${key}`;
+  
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 15000); // 15秒超时
+
+    const response = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      signal: controller.signal,
       body: JSON.stringify({
-        // Gemini 1.5 专有的系统指令，能极大地稳定输出风格
-        system_instruction: {
-          parts: [{ text: systemInstruction }]
-        },
-        contents: [{
-          parts: [{ text: userPrompt }]
-        }],
-        generationConfig: {
-          temperature: 0.3, // 降低随机性，确保报价和编码的严谨性
-          topP: 0.8,
-          maxOutputTokens: 2048,
-          responseMimeType: "text/plain"
+        system_instruction: { parts: [{ text: system }] },
+        contents: [{ parts: [{ text: user }] }],
+        generationConfig: { 
+          temperature: 0.3, 
+          maxOutputTokens: 2000,
+          topP: 0.8
         }
       })
     });
 
+    clearTimeout(timeout);
     const data = await response.json();
-    if (data.error) throw new Error(`Gemini API Error: ${data.error.message}`);
 
-    const resultText = data.candidates?.[0]?.content?.parts?.[0]?.text || "No AI response generated.";
+    if (data.error) {
+      return new Response(JSON.stringify({ result: `AI 暂时不可用: ${data.error.message}` }), { headers });
+    }
 
-    return new Response(JSON.stringify({ result: resultText }), {
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      status: 200,
-    })
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "AI 忙碌中，请稍后。";
+    return new Response(JSON.stringify({ result: text }), { headers });
 
-  } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
-      headers: { ...corsHeaders, 'Content-Type': 'application/json' },
-      status: 500,
-    })
+  } catch (e) {
+    const msg = e.name === 'AbortError' ? "请求超时，请稍后重试" : e.message;
+    return new Response(JSON.stringify({ result: `连接 AI 失败: ${msg}` }), { headers });
   }
-})
+}
