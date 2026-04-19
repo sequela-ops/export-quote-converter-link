@@ -1,5 +1,5 @@
 /**
- * 外贸报价计算器 Pro - V7.1.0 (Qwen AI集成版)
+ * 外贸报价计算器 Pro - V7.1.0  (Qwen AI集成版)
  * 部署环境: Supabase Edge Functions (Deno)
  * 核心引擎: Qwen API (支持 Qwen3.6-plus)
  * 架构: SSE Streaming — 解决 25s wall-clock timeout 问题
@@ -82,9 +82,9 @@ Incoterms: ${payload.incoterms}
 
 Destination: ${payload.destination}
 
-Quoted Price: USD ${payload.unitPrice}
+Quoted Price: ${payload.unitPrice}
 
-Total Amount: USD ${payload.totalPrice}
+Total Amount: ${payload.totalPrice}
 ${logisticsInfo}
 
 Key Notes: ${payload.notes}
@@ -202,87 +202,106 @@ headers: { ...corsHeaders, 'Content-Type': 'text/event-stream' }
  * 核心 API 调用函数 — SSE Streaming 版本
  */
 async function callQwenAPIStream(key: string, system: string, user: string, corsHeaders: Record<string, string>) {
-const url = `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`;
+  const url = `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`;
 
-const { readable, writable } = new TransformStream();
-const writer = writable.getWriter();
-const encoder = new TextEncoder();
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
+  const encoder = new TextEncoder();
 
-(async () => {
-try {
-const response = await fetch(url, {
-method: 'POST',
-headers: {
-'Content-Type': 'application/json',
-'Authorization': `Bearer ${key}`
-},
-body: JSON.stringify({
-model: "qwen3.6-plus",
-messages: [
-{ role: "system", content: system },
-{ role: "user", content: user }
-],
-temperature: 0.3,
-max_tokens: 2000,
-top_p: 0.8,
-stream: true
-})
-});
+  (async () => {
+    try {
+      // 【Fix-1: 握手激活】fetch 发出前立即写入 SSE 注释行，激活网关连接。
+      // qwen3.6-plus thinking 阶段可达 30-50s，不发字节会触发 Supabase 25s
+      // wall-clock timeout，导致 "connection closed before message completed"。
+      // SSE 规范：冒号开头为注释行，前端 EventSource / 手动解析器均静默忽略。
+      await writer.write(encoder.encode(": handshake
 
-if (!response.ok) {
-    const errorText = await response.text();
-    const errMsg = `HTTP ${response.status}: ${errorText.slice(0, 200)}`;
-    await writer.write(encoder.encode(`data: ${JSON.stringify({ error: errMsg })}\n\n`));
-    await writer.write(encoder.encode(`data: [DONE]\n\n`));
-    await writer.close();
-    return;
-  }
+"));
 
-  const reader = response.body.getReader();
-  const decoder = new TextDecoder();
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${key}`
+        },
+        body: JSON.stringify({
+          model: "qwen3.6-plus",
+          messages: [
+            { role: "system", content: system },
+            { role: "user", content: user }
+          ],
+          temperature: 0.3,
+          max_tokens: 2000,
+          top_p: 0.8,
+          stream: true
+        })
+      });
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    const chunk = decoder.decode(value, { stream: true });
-    const lines = chunk.split('\n');
-
-    for (const line of lines) {
-      if (!line.startsWith('data: ')) continue;
-      const raw = line.slice(6).trim();
-      if (raw === '[DONE]') {
-        await writer.write(encoder.encode(`data: [DONE]\n\n`));
-        continue;
+      // 【Fix-2: 错误流化】上游报错时 throw 进 catch，统一序列化进流。
+      // 前端 callAIEngine 的 parsed.error 分支负责弹窗，而非触发网络抖动重试。
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(`Aliyun API Error (${response.status}): ${errorText.slice(0, 200)}`);
       }
-      try {
-        const parsed = JSON.parse(raw);
-        const content = parsed.choices?.[0]?.delta?.content;
-        if (content) {
-          await writer.write(encoder.encode(`data: ${JSON.stringify({ chunk: content })}\n\n`));
+
+      // 【Fix-3: 防御性 body 校验】body 为 null 时提前抛出，避免 .getReader() 崩溃
+      const reader = response.body?.getReader();
+      if (!reader) throw new Error("Upstream response body is empty");
+
+      const decoder = new TextDecoder();
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split('
+');
+
+        for (const line of lines) {
+          if (!line.startsWith('data: ')) continue;
+          const raw = line.slice(6).trim();
+          // 【Fix-4: 单一 [DONE]】跳过上游信号，由 finally 统一发送，
+          // 防止"上游转发一次 + finally 再发一次"造成前端收到双重结束信号。
+          if (raw === '[DONE]') continue;
+          try {
+            const parsed = JSON.parse(raw);
+            // 过滤 thinking 内容（reasoning_content），只转发 content
+            const content = parsed.choices?.[0]?.delta?.content;
+            if (content) {
+              await writer.write(encoder.encode(`data: ${JSON.stringify({ chunk: content })}
+
+`));
+            }
+          } catch {
+            // 跳过心跳包或非 JSON 行，不中断循环
+          }
         }
-      } catch {
-        // 跳过无法解析的行（心跳包等）
       }
+
+    } catch (e) {
+      console.error("[Backend Stream Error]:", e.message);
+      // 将错误序列化进流，保持前端 SSE 解析路径一致
+      await writer.write(encoder.encode(`data: ${JSON.stringify({ error: e.message })}
+
+`));
+    } finally {
+      // 【Fix-5: 统一收尾】无论成功/失败，由此处发送结束标志并关闭流，
+      // 确保 Deno 实例资源释放，不留悬挂连接。
+      await writer.write(encoder.encode("data: [DONE]
+
+"));
+      await writer.close().catch(() => {});
     }
-  }
+  })();
 
-} catch (e) {
-  const msg = e.name === 'AbortError' ? "上游请求超时" : e.message;
-  await writer.write(encoder.encode(`data: ${JSON.stringify({ error: `连接 AI 失败: ${msg}` })}\n\n`));
-  await writer.write(encoder.encode(`data: [DONE]\n\n`));
-} finally {
-  await writer.close().catch(() => {});
-}
-
-})();
-
-return new Response(readable, {
-headers: {
-...corsHeaders,
-'Content-Type': 'text/event-stream',
-'Cache-Control': 'no-cache',
-'X-Accel-Buffering': 'no'
-}
-});
+  // 立即返回可读流，0ms 首包响应，不阻塞等待 Qwen thinking 阶段
+  return new Response(readable, {
+    headers: {
+      ...corsHeaders,
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'X-Accel-Buffering': 'no'
+    }
+  });
 }
