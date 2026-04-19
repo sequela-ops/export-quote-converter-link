@@ -95,7 +95,7 @@ Task
 
 撰写一封以"推动客户确认订单"为目标的英文报价邮件。
 
-Requirements (必须执行)
+Requirements (必修执行)
 1. 成交结构（必须遵循）
 
 Hook（1句）：确认需求，直接进入主题
@@ -253,8 +253,7 @@ async function callQwenAPIStream(key: string, system: string, user: string, cors
         if (done) break;
 
         const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split('
-');
+        const lines = chunk.split('\n');
 
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue;
@@ -268,7 +267,6 @@ async function callQwenAPIStream(key: string, system: string, user: string, cors
             const content = parsed.choices?.[0]?.delta?.content;
             if (content) {
               await writer.write(encoder.encode(`data: ${JSON.stringify({ chunk: content })}\n\n`));
-
             }
           } catch {
             // 跳过心跳包或非 JSON 行，不中断循环
@@ -279,14 +277,11 @@ async function callQwenAPIStream(key: string, system: string, user: string, cors
     } catch (e) {
       console.error("[Backend Stream Error]:", e.message);
       // 将错误序列化进流，保持前端 SSE 解析路径一致
-      await writer.write(encoder.encode(`data: ${JSON.stringify({ error: e.message })}
-\n\n`));
-
+      await writer.write(encoder.encode(`data: ${JSON.stringify({ error: e.message })}\n\n`));
     } finally {
       // 【Fix-5: 统一收尾】无论成功/失败，由此处发送结束标志并关闭流，
       // 确保 Deno 实例资源释放，不留悬挂连接。
       await writer.write(encoder.encode("data: [DONE]\n\n"));
-
       await writer.close().catch(() => {});
     }
   })();
