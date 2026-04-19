@@ -1,5 +1,5 @@
 /**
- * 外贸报价计算器 Pro - V7.1.0  (Qwen AI集成版)
+ * 外贸报价计算器 Pro - V7.3.0  (Qwen AI集成版)
  * 部署环境: Supabase Edge Functions (Deno)
  * 核心引擎: Qwen API (支持 Qwen3.6-plus)
  * 架构: SSE Streaming — 解决 25s wall-clock timeout 问题
@@ -161,7 +161,8 @@ ${hasLogistics
 直接输出邮件正文
 `;
 
-  return await callQwenAPIStream(apiKey, systemInstruction, userPrompt, corsHeaders);
+  // ✅ 手术级补丁：末尾透传 req.signal 感知客户端真实存活状态
+  return await callQwenAPIStream(apiKey, systemInstruction, userPrompt, corsHeaders, req.signal);
 }
 
 // --- 场景二：智能 HS Code 审计 ---
@@ -175,7 +176,8 @@ else if (action === 'predict_hs') {
     3. 🛡️ 准入认证:[必要证书如CE/FDA/GCC等]
     4. 🚨 清关风控:[反倾销或禁限规则提醒]
   `;
-  return await callQwenAPIStream(apiKey, systemInstruction, userPrompt, corsHeaders);
+  // ✅ 手术级补丁：末尾透传 req.signal
+  return await callQwenAPIStream(apiKey, systemInstruction, userPrompt, corsHeaders, req.signal);
 }
 
 throw new Error("UNKNOWN_ACTION");
@@ -199,22 +201,31 @@ headers: { ...corsHeaders, 'Content-Type': 'text/event-stream' }
 })
 
 /**
- * 核心 API 调用函数 — SSE Streaming 版本
+ * 核心 API 调用函数 — 彻底解决深思大模型“静默窒息”的终极保活版 (V4 双引擎版)
  */
-async function callQwenAPIStream(key: string, system: string, user: string, corsHeaders: Record<string, string>) {
+async function callQwenAPIStream(key: string, system: string, user: string, corsHeaders: Record<string, string>, reqSignal: AbortSignal) {
   const url = `https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions`;
 
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
   const encoder = new TextEncoder();
 
+  // 安全写入封装，吞噬由于并发断开导致的 Broken Pipe 异常
+  const safeWrite = async (data: string) => {
+    if (reqSignal.aborted) return;
+    try { await writer.write(encoder.encode(data)); } catch (e) {}
+  };
+
   (async () => {
+    // 【终极防线：独立起搏器】解决阿里云晚高峰 GPU 排队、连首包都不发的绝对静默问题
+    // 每 10 秒强制向前端发送一次心跳，独立于 API 返回流之外
+    const keepAliveTimer = setInterval(() => {
+      safeWrite(": keep-alive-ping\n\n");
+    }, 10000);
+
     try {
-      // 【Fix-1: 握手激活】fetch 发出前立即写入 SSE 注释行，激活网关连接。
-      // qwen3.6-plus thinking 阶段可达 30-50s，不发字节会触发 Supabase 25s
-      // wall-clock timeout，导致 "connection closed before message completed"。
-      // SSE 规范：冒号开头为注释行，前端 EventSource / 手动解析器均静默忽略。
-      await writer.write(encoder.encode(": handshake\n\n"));
+      // 第一道心跳：初始握手，突破首包等待期的网关拦截
+      await safeWrite(": handshake\n\n");
 
       const response = await fetch(url, {
         method: 'POST',
@@ -224,7 +235,7 @@ async function callQwenAPIStream(key: string, system: string, user: string, cors
         },
         body: JSON.stringify({
           model: "qwen3.6-plus",
-          messages: [
+          messages:[
             { role: "system", content: system },
             { role: "user", content: user }
           ],
@@ -232,57 +243,66 @@ async function callQwenAPIStream(key: string, system: string, user: string, cors
           max_tokens: 2000,
           top_p: 0.8,
           stream: true
-        })
+        }),
+        signal: reqSignal // 绑定客户端生命周期，人走灯灭，不浪费一分钱
       });
 
-      // 【Fix-2: 错误流化】上游报错时 throw 进 catch，统一序列化进流。
-      // 前端 callAIEngine 的 parsed.error 分支负责弹窗，而非触发网络抖动重试。
       if (!response.ok) {
         const errorText = await response.text();
         throw new Error(`Aliyun API Error (${response.status}): ${errorText.slice(0, 200)}`);
       }
 
-      // 【Fix-3: 防御性 body 校验】body 为 null 时提前抛出，避免 .getReader() 崩溃
       const reader = response.body?.getReader();
       if (!reader) throw new Error("Upstream response body is empty");
 
       const decoder = new TextDecoder();
+      let lineBuffer = ""; 
 
       while (true) {
+        if (reqSignal.aborted) break; // 客户端离开，立刻停止拉取
+
         const { done, value } = await reader.read();
         if (done) break;
 
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split('\n');
+        lineBuffer += decoder.decode(value, { stream: true });
+        const lines = lineBuffer.split('\n');
+        lineBuffer = lines.pop() || ""; 
 
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue;
           const raw = line.slice(6).trim();
-          // 【Fix-4: 单一 [DONE]】跳过上游信号，由 finally 统一发送，
-          // 防止"上游转发一次 + finally 再发一次"造成前端收到双重结束信号。
           if (raw === '[DONE]') continue;
+          
           try {
             const parsed = JSON.parse(raw);
-            // 过滤 thinking 内容（reasoning_content），只转发 content
             const content = parsed.choices?.[0]?.delta?.content;
+            
+            // 抓取模型的思考过程（reasoning_content）
+            const reasoning = parsed.choices?.[0]?.delta?.reasoning_content;
+
             if (content) {
-              await writer.write(encoder.encode(`data: ${JSON.stringify({ chunk: content })}\n\n`));
+              // 1. 正式内容：正常输出给网页显示
+              await safeWrite(`data: ${JSON.stringify({ chunk: content })}\n\n`);
+            } else if (reasoning) {
+              // 2. 思考期映射流：骗过网关，强制重置 Supabase/Nginx 的 Idle Timeout
+              await safeWrite(`: heartbeat\n\n`);
             }
-          } catch {
-            // 跳过心跳包或非 JSON 行，不中断循环
-          }
+          } catch { continue; } // 忽略非标准 JSON 的解析报错
         }
       }
-
     } catch (e) {
       console.error("[Backend Stream Error]:", e.message);
-      // 将错误序列化进流，保持前端 SSE 解析路径一致
-      await writer.write(encoder.encode(`data: ${JSON.stringify({ error: e.message })}\n\n`));
+      if (!reqSignal.aborted) {
+        await safeWrite(`data: ${JSON.stringify({ error: e.message })}\n\n`);
+      }
     } finally {
-      // 【Fix-5: 统一收尾】无论成功/失败，由此处发送结束标志并关闭流，
-      // 确保 Deno 实例资源释放，不留悬挂连接。
-      await writer.write(encoder.encode("data: [DONE]\n\n"));
-      await writer.close().catch(() => {});
+      // 停止起搏器，防止内存泄漏
+      clearInterval(keepAliveTimer);
+      
+      if (!reqSignal.aborted) {
+        await safeWrite("data: [DONE]\n\n");
+      }
+      try { await writer.close(); } catch (_) {}
     }
   })();
 
