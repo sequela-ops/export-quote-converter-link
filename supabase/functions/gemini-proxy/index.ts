@@ -1,9 +1,31 @@
 /**
- * 外贸报价计算器 Pro - V7.3.0  (Qwen AI集成版)
+ * 外贸报价计算器 Pro  (Qwen AI集成版）
  * 部署环境: Supabase Edge Functions (Deno)
  * 核心引擎: Qwen API (支持 Qwen3.6-plus)
  * 架构: SSE Streaming — 解决 25s wall-clock timeout 问题
  */
+
+import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
+
+// 输入清洗：剥离换行 + 长度截断，挡住 prompt injection 与 token 滥用
+const sanitize = (s: unknown, max = 500) =>
+  String(s ?? '').replace(/[\r\n]+/g, ' ').slice(0, max)
+
+// 鉴权失败时以 SSE 流格式返回错误，与前端解析协议保持一致
+const authErrorStream = (errMsg: string, corsHeaders: Record<string, string>) => {
+  const stream = new ReadableStream({
+    start(controller) {
+      const data = JSON.stringify({ error: errMsg });
+      controller.enqueue(new TextEncoder().encode(`data: ${data}\n\n`));
+      controller.enqueue(new TextEncoder().encode(`data: [DONE]\n\n`));
+      controller.close();
+    }
+  });
+  return new Response(stream, {
+    status: 200,
+    headers: { ...corsHeaders, 'Content-Type': 'text/event-stream' }
+  });
+};
 
 Deno.serve(async (req) => {
 // 1. 获取当前请求的来源域名
@@ -27,6 +49,23 @@ const corsHeaders = {
 if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
 
 try {
+// ── JWT 校验：拒绝裸 anon key 调用，强制必须有真实用户 session ──
+const authHeader = req.headers.get('Authorization') || ''
+const jwt = authHeader.replace(/^Bearer\s+/i, '')
+const anonKey = Deno.env.get('SUPABASE_ANON_KEY')
+if (!jwt || jwt === anonKey) {
+  return authErrorStream('AUTH_REQUIRED', corsHeaders)
+}
+const sb = createClient(
+  Deno.env.get('SUPABASE_URL')!,
+  anonKey!,
+  { global: { headers: { Authorization: `Bearer ${jwt}` } } }
+)
+const { data: { user } } = await sb.auth.getUser()
+if (!user) {
+  return authErrorStream('INVALID_TOKEN', corsHeaders)
+}
+
 const { action, payload } = await req.json()
 const apiKey = Deno.env.get('QWEN_API_KEY')
 
@@ -59,8 +98,8 @@ if (action === 'generate_email') {
     const lc = payload.logisticsContext;
     hasLogistics = true;
     const cartons = Math.ceil(lc.totalPcs / (lc.pcsPerCarton || 1));
-    logisticsInfo = `- Logistics Detail: Route [${lc.mode}], Total ${cartons} Cartons.
-   - Specs: ${lc.dimensions}, Gross Wt: ${lc.grossWeight}. Unit Freight: ${lc.unitFreight}.
+    logisticsInfo = `- Logistics Detail: Route [${sanitize(lc.mode, 60)}], Total ${cartons} Cartons.
+   - Specs: ${sanitize(lc.dimensions, 80)}, Gross Wt: ${sanitize(lc.grossWeight, 50)}. Unit Freight: ${sanitize(lc.unitFreight, 50)}.
    - Feasibility: Current space availability checked for these dimensions.`;
 
   } else if (payload.logisticsData?.l && payload.logisticsData?.perCtn) {
@@ -69,27 +108,27 @@ if (action === 'generate_email') {
     hasLogistics = true;
     const cartons = Math.ceil(ld.totalPcs / ld.perCtn);
     const unit = (ld.logisticsMode === 'sea') ? 'RT' : 'KG';
-    logisticsInfo = `- Logistics Detail: ${cartons} Cartons, ${ld.result} ${unit}
+    logisticsInfo = `- Logistics Detail: ${cartons} Cartons, ${sanitize(ld.result, 50)} ${unit}
    - Feasibility: Current space availability checked for these dimensions.`;
   }
 
   const userPrompt = `
 Context
 
-Product: ${payload.productName || 'Target Product'}
+Product: ${sanitize(payload.productName || 'Target Product', 200)}
 
-Incoterms: ${payload.incoterms}
+Incoterms: ${sanitize(payload.incoterms, 30)}
 
-Destination: ${payload.destination}
+Destination: ${sanitize(payload.destination, 120)}
 
-Quoted Price: ${payload.unitPrice}
+Quoted Price: ${sanitize(payload.unitPrice, 60)}
 
-Total Amount: ${payload.totalPrice}
+Total Amount: ${sanitize(payload.totalPrice, 60)}
 ${logisticsInfo}
 
-Key Notes: ${payload.notes}
+Key Notes: ${sanitize(payload.notes, 800)}
 
-Sales Mode: ${payload.salesMode || 'Balanced'}
+Sales Mode: ${sanitize(payload.salesMode || 'Balanced', 30)}
 
 Task
 
@@ -169,7 +208,7 @@ ${hasLogistics
 else if (action === 'predict_hs') {
   const systemInstruction = `你是一位精通全球海关编码与国际贸易合规的审计专家。`;
   const userPrompt = `
-    分析产品 "${payload.productDescription}" 进入 "${payload.destinationCountry}" 的贸易环境。
+    分析产品 "${sanitize(payload.productDescription, 500)}" 进入 "${sanitize(payload.destinationCountry, 120)}" 的贸易环境。
     请严格按此格式返回（简体中文）：
     1. 📋 建议 HS Code: [给出6位国际通用码及逻辑]
     2. 📉 进口成本:[目标国关税与VAT环境]
@@ -219,11 +258,21 @@ async function callQwenAPIStream(key: string, system: string, user: string, cors
   (async () => {
     // 【终极防线：独立起搏器】解决阿里云晚高峰 GPU 排队、连首包都不发的绝对静默问题
     // 每 10 秒强制向前端发送一次心跳，独立于 API 返回流之外
-    const keepAliveTimer = setInterval(() => {
-      safeWrite(": keep-alive-ping\n\n");
-    }, 10000);
+    let keepAliveTimer: number | undefined;
+
+    const cleanup = () => {
+      if (keepAliveTimer !== undefined) {
+        clearInterval(keepAliveTimer);
+        keepAliveTimer = undefined;
+      }
+    };
+    reqSignal.addEventListener('abort', cleanup, { once: true });
 
     try {
+      keepAliveTimer = setInterval(() => {
+        safeWrite(": keep-alive-ping\n\n");
+      }, 10000);
+
       // 第一道心跳：初始握手，突破首包等待期的网关拦截
       await safeWrite(": handshake\n\n");
 
@@ -297,7 +346,7 @@ async function callQwenAPIStream(key: string, system: string, user: string, cors
       }
     } finally {
       // 停止起搏器，防止内存泄漏
-      clearInterval(keepAliveTimer);
+      cleanup();
       
       if (!reqSignal.aborted) {
         await safeWrite("data: [DONE]\n\n");
